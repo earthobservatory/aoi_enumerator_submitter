@@ -13,6 +13,7 @@ import sys
 import json
 import requests
 from datetime import datetime
+import time
 import dateutil.parser
 import numpy as np
 from hysds.celery import app
@@ -28,45 +29,61 @@ def main():
     minmatch = ctx.get('minMatch', 2)
     acquisition_version = ctx.get('acquisition_version')
     #get all precision orbits that intersect the AOI
+    resorbs = get_objects('resorb', aoi)
     poeorbs = get_objects('poeorb', aoi)
     #for each track in input
     if tracks is False:
         #run for all tracks
         print('Querying for all tracks...')
-        submit_all_jobs(poeorbs, aoi, False, queue, enumeration_job_version, minmatch, acquisition_version, skip_days)
+        submit_all_jobs(poeorbs, resorbs, aoi, False, queue, enumeration_job_version, minmatch, acquisition_version, skip_days)
     else:
         for track in tracks:
             print('Querying for track: {}...'.format(track))
-            submit_all_jobs(poeorbs, aoi, track, queue, enumeration_job_version, minmatch, acquisition_version, skip_days)
+            submit_all_jobs(poeorbs, resorbs, aoi, track, queue, enumeration_job_version, minmatch, acquisition_version, skip_days)
        
-def submit_all_jobs(poeorbs, aoi, track, queue, version, minmatch, acquisition_version, skip_days):
+def submit_all_jobs(poeorbs, resorbs, aoi, track, queue, version, minmatch, acquisition_version, skip_days):
     '''gets all the covered acquisitions, determine intersects, & submit enum jobs'''
     #get all acquisitions covered by the AOI & optional tracks
     acquisitions = get_objects('acq', aoi, track)
     print('Found {} acquisitions'.format(len(acquisitions)))
     #determine which precision orbits intersect acquisitions
-    matching_poeorbs = determine_matching_poeorbs(poeorbs, acquisitions)
-    print('Found {} matching poeorbs'.format(len(matching_poeorbs)))
+    matching_orbits = determine_matching_orbits(poeorbs, resorbs, acquisitions)
+    print('Found {} matching orbits'.format(len(matching_orbits)))
     #submit enumeration jobs for that AOI and track
-    for poeorb in matching_poeorbs:
-        print('Submitting enumeration job for poeorb: {}'.format(poeorb.get('_id')))
-        submit_enum_job(poeorb, aoi, track, queue, version, minmatch, acquisition_version, skip_days)
+    for orbit in matching_orbits:
+        print('Submitting enumeration job for orbit: {}'.format(orbit.get('_id')))
+        submit_enum_job(orbit, aoi, track, queue, version, minmatch, acquisition_version, skip_days)
 
-def determine_matching_poeorbs(poeorbs, acquisitions):
+def determine_matching_orbits(poeorbs, resorbs, acquisitions):
     '''determines which poeorbs are covered by an acquisition. returns a list of those poeorbs'''
     acq_a_dict, acq_b_dict = build_acq_dict(acquisitions) #make a dict where the key is the starttime
     ma = build_acquisition_matrix(acq_a_dict) #builds a matrix of starttime endtime plots
     mb = build_acquisition_matrix(acq_b_dict)
     matching = {}
+
+    last_poeorb_end = 0  #finds the last end time for resorb to continue on
     for poeorb in poeorbs:
         starttime = int(dateutil.parser.parse(poeorb.get('_source', {}).get('starttime', False)).strftime('%s'))
         endtime = int(dateutil.parser.parse(poeorb.get('_source', {}).get('endtime', False)).strftime('%s'))
+        if endtime > last_poeorb_end: last_poeorb_end = endtime #update last poeorb end
         if poeorb.get('_source', {}).get('metadata', {}).get('platform', False) == 'Sentinel-1A':
             count = ((ma > starttime) & (ma < endtime)).sum()
         else:
             count = ((mb > starttime) & (mb < endtime)).sum()
         if count > 0:
             matching[poeorb.get('_id', False)] = poeorb
+
+    for resorb in resorbs:
+        starttime = int(dateutil.parser.parse(resorb.get('_source', {}).get('starttime', False)).strftime('%s'))
+        endtime = int(dateutil.parser.parse(resorb.get('_source', {}).get('endtime', False)).strftime('%s'))
+        if starttime > last_poeorb_end:
+            if resorb.get('_source', {}).get('metadata', {}).get('platform', False) == 'Sentinel-1A':
+                count = ((ma > starttime) & (ma < endtime)).sum()
+            else:
+                count = ((mb > starttime) & (mb < endtime)).sum()
+            if count > 0:
+                matching[resorb.get('_id', False)] = resorb
+
     return list(matching.values())
 
 def build_acq_dict(acquisitions):
@@ -123,7 +140,7 @@ def get_objects(object_type, aoi, track=False):
     '''returns all objects of the object type that intersect both
     temporally and spatially with the aoi. POEORB doesn't have a spatial query'''
     #determine index
-    idx_dct = {'acq': 'grq_*_acquisition-s1-iw_slc', 'poeorb' : 'grq_*_s1-aux_poeorb'}
+    idx_dct = {'acq': 'grq_*_acquisition-s1-iw_slc', 'poeorb' : 'grq_*_s1-aux_poeorb', 'resorb': 'grq_*_s1-aux_resorb'}
     idx = idx_dct.get(object_type)
     starttime = aoi.get('_source', {}).get('starttime')
     endtime = aoi.get('_source', {}).get('endtime')
@@ -139,6 +156,9 @@ def get_objects(object_type, aoi, track=False):
             grq_query = {"query":{"filtered":{"query":{"geo_shape":{"location": {"shape":location}}},"filter":{"bool":{"must":[{"range":{"endtime":{"from":starttime}}},{"range":{"starttime":{"to":endtime}}}]}}}},"from":0,"size":1000}
     elif object_type == 'poeorb':
         #query for poeorb
+        grq_query = {"query":{"filtered":{"filter":{"bool":{"must":[{"range":{"endtime":{"from":starttime}}},{"range":{"starttime":{"to":endtime}}}]}}}},"from":0,"size":1000}
+    elif object_type == 'resorb':
+        #query for resorb
         grq_query = {"query":{"filtered":{"filter":{"bool":{"must":[{"range":{"endtime":{"from":starttime}}},{"range":{"starttime":{"to":endtime}}}]}}}},"from":0,"size":1000}
     results = query_es(grq_url, grq_query)
     return results
